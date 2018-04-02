@@ -1,14 +1,28 @@
 # Link_traffic module - README
 
 ## Description
-This module processes flow data (sums flows, bytes, packets for each LINK_BIT_FIELD). Munin plugin then connects to it via UNIX socket to create graphs.
+link_traffic processes flow data (sums flows, bytes, packets for each LINK_BIT_FIELD). Munin plugin then connects to it via UNIX socket to create graphs.
+
+Module is configured by sysrepo. Data model is in 'yang/link-traffic.yang' and basic configuration in 'yang/link-traffic.data.json'. More about sysrepo configuration below.
 
 ## Interfaces
 - Input: 1
 - Output: 0
 
 ## Module configuration
-To configure link_traffic module change link_traff_conf.cfg.example and remove ".example" suffix. In this icnluded file is CESNET's configuration for CESNET2 as an inspiration. 
+This module is configured by sysrepo. You load YANG module to your sysrepo datastore by:
+```
+sudo sysrepoctl --install --module=link-traffic --yang=yang/link-traffic.yang --owner=user:user --permission=644
+```
+To upload initial configuration to startup datastore use:
+```
+sysrepocfg --datastore=startup --import=yang/link-traffic.data.json --format=json link-traffic
+```
+Then if you want to edit running configuration while the module is running use:
+```
+sysrepocfg -e vim link-traffic
+```
+link_traffic will check if your configuration is valid and if so, it will change the output accordingly.
 
 ## Parameters
 ### Common TRAP parameters
@@ -22,8 +36,8 @@ To configure link_traffic module change link_traff_conf.cfg.example and remove "
 Module collects statistics about flows according to LINK_BIT_FIELD. Running module creates a UNIX socket (/var/run/libtrap/munin_link_traffic). Munin plugin then connects to this socket and gets formatted string with data. The format is the following (the number of headers is not limited):
 
 ```
-"header1,header2,header3\n
-value1,value2,value3"
+"header1, header2, header3\n
+value1, value2, value3"
 ```
 When munin plugin starts it checks /tmp/munin_link_traffic_data.txt. If it is actual enough it uses cached data, if its not actual it connects to UNIX socket and creates new cache file.
 
@@ -32,3 +46,4 @@ When munin plugin starts it checks /tmp/munin_link_traffic_data.txt. If it is ac
 In order to get data into munin server you need to set it up. Easies way is to execute suggested commands to activate graphs you want: `munin-node-configure --suggest --shell`
 
 When the confituration is done you need to restart munin-node service: `service munin-node restart`
+

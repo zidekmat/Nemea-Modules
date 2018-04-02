@@ -56,25 +56,22 @@
 #include <unirec/unirec.h>
 #include <pthread.h>
 #include <sys/socket.h>
-#include <sys/time.h>
-#include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <stdlib.h>
 #include "fields.h"
-#include <time.h>
-#include <errno.h>
 #include <unistd.h>
-#include <sys/select.h>
-#include <ctype.h>
+#include <sysrepo.h>
+#include <sysrepo/values.h>
+
 /**
  * Definition of fields used in unirec templates (for both input and output interfaces)
  */
 UR_FIELDS (
-   uint64 BYTES,
-   uint64 LINK_BIT_FIELD,
-   uint32 PACKETS,
-   uint8 DIR_BIT_FIELD,
+   uint64 BYTES, /* number of bytes */
+   uint64 LINK_BIT_FIELD, /* identifier for link in UniRec */
+   uint32 PACKETS, /* number of packets */
+   uint8 DIR_BIT_FIELD /* direction in which data flow */
 )
 
 trap_module_info_t *module_info = NULL;
@@ -84,25 +81,13 @@ trap_module_info_t *module_info = NULL;
  */
 #define MODULE_BASIC_INFO(BASIC) \
   BASIC("Link Flows Counter","This module counts statistics according to link and direction.", 1, 0)
-
-/**
- * Definition of module parameters - every parameter has short_opt, long_opt, description,
- * flag whether an argument is required or it is optional and argument type which is NULL
- * in case the parameter does not need argument.
- * Module parameter argument types: int8, int16, int32, int64, uint8, uint16, uint32, uint64, float, string
- */
-#define MODULE_PARAMS(PARAM)
+#define MODULE_PARAMS(PARAM) \
+   PARAM('x', "sysrepo_xpath", "Sysrepo XPATH to instance configuration", required_argument, "string")
 #define DEF_SOCKET_PATH "/var/run/libtrap/munin_link_traffic"
-#define CONFIG_PATH SYSCONFDIR"/link_traffic/link_traff_conf.cfg"
-#define CONFIG_VALUES 4 /* Definition of how many values link's config has. */
-/* Definition of config attributes */
-#define LINK_NUM 		      1
-#define LINK_NAME       	2
-#define LINK_UR_FIELD		3
-#define LINK_COL		      4
-#define CONFIG_VALUES      4 //Definition of how many values link's config has.
+#define XPATH_MAX_LEN 164 // the longest XPATH that node in YANG schema can have
 
 static volatile int stop = 0;
+char *sr_inst_xpath = NULL;
 
 /**
  * Function to handle SIGTERM and SIGINT signals (used to stop the module)
@@ -110,35 +95,35 @@ static volatile int stop = 0;
 TRAP_DEFAULT_SIGNAL_HANDLER(stop = 1)
 
 typedef struct link_stats {
-   volatile uint64_t flows_in;
-   volatile uint32_t packets_in;
-   volatile uint64_t bytes_in;
-   volatile uint64_t flows_out;
-   volatile uint32_t packets_out;
-   volatile uint64_t bytes_out;
+   volatile uint64_t flows_in; /*!uint64_t incomming flows */
+   volatile uint32_t packets_in; /*!uint32_t incomming packets */
+   volatile uint64_t bytes_in; /*!uint64_t incomming bytes */
+   volatile uint64_t flows_out; /*!uint64_t outgoing flows */
+   volatile uint32_t packets_out; /*!uint32_t outgoing packets */
+   volatile uint64_t bytes_out; /*!uint64_t outgoing bytes */
 } link_stats_t;
 
-/* global dynamic array od link_stats_t structure for statistics */
-link_stats_t *stats = NULL;
-
 typedef struct link_conf {
-   uint64_t       m_val;            /*!int number of link*/
-   char           *m_name;          /*!string name of link*/
-   char           *m_ur_field;      /*!string link bit field of link*/
-   uint32_t       m_color;          /*!int represents hex value of link color*/
-   uint16_t       m_id;             /*!uint16_t a unique link identificator */
+   int         m_num;        /*!int number of link*/
+   char        *m_name;      /*!string name of link*/
+   char        *m_ur_field;  /*!string link bit field of link*/
+   uint32_t    m_color;      /*!int represents hex value of link's color*/
 } link_conf_t;
 
-/* structure used for loading configuration from file and passing it
+/* structure used for loading configuration and passing it
  * to the thread */
 typedef struct link_loaded {
-   link_conf_t    *conf;    /*! struct of loaded links configuration */
-   size_t         num;       /*! size_t number of loaded links */
+   link_conf_t    *conf;     /*!struct of loaded links configuration */
+   link_stats_t   *stats;    /*!array of link_stats_t structure for statistics */
+   size_t         num;       /*!size_t number of loaded links */
 } link_load_t;
 
-/*! @brief function that clears link_conf array
- * @return positive value on success otherwise negative
- * */
+pthread_mutex_t lock_stop; /* For locking global int to stop program routine */
+pthread_mutex_t lock_links; /* For locking access to links struct */
+
+/**
+ * Clears all but the initial pointer of link_load_t struct.
+ */
 void clear_conf_struct(link_load_t *links)
 {
    int i;
@@ -146,155 +131,25 @@ void clear_conf_struct(link_load_t *links)
    if (!links) {
       return;
    }
-
    if (links->conf) {
       for (i = 0; i < links->num; i++) {
          if (links->conf[i].m_name) {
             free(links->conf[i].m_name);
+            links->conf[i].m_name = NULL;
          }
-
          if (links->conf[i].m_ur_field) {
             free(links->conf[i].m_ur_field);
+            links->conf[i].m_ur_field = NULL;
          }
-
       }
-
       free(links->conf);
+      links->conf = NULL;
+      if(links->stats){
+         free(links->stats);
+         links->stats = NULL;
+      }
    }
-
-   free(links);
-}
-
-/*! @brief a compare function for quick sort using link_conf_t structure */
-int confcmp(const void *cfg1, const void *cfg2)
-{
-   return ((link_conf_t *) cfg2)->m_val - ((link_conf_t *) cfg1)->m_val;
-}
-
-/*   *** Parsing link names from config file ***
-*   Function goes through text file line by line and search for specific pattern
-*   input arg: fileName is path to config file, arrayCnt is counter for array and size
-*   stores size of memory for array
-*   */
-int load_links(const char *filePath, link_load_t *links)
-{
-   FILE *fp = NULL;
-   char *line = NULL, *tok = NULL, *save_pt1 = NULL, *str1 = NULL, *it;
-   size_t attribute = 0, len = 0, size = 10;
-   int num = 0;
-   ssize_t read;
-
-   if (!links) {
-      fprintf(stderr, "Error: load_links received NULL pointer\n");
-      return 1;
-   }
-
-   links->conf = (link_conf_t *) calloc(size, sizeof(link_conf_t));
-   if (!links->conf) {
-      fprintf(stderr, "Error: Cannot allocate memory for links.\n");
-      goto failure;
-   }
-
    links->num = 0;
-   printf("Accessing config file %s.\n", filePath);
-   fp = fopen(filePath, "r");
-   if (!fp) {
-      fprintf(stderr, "Error while opening config file %s\n", filePath);
-      goto failure;
-   }
-
-   /* start parsig csv config here. */
-   while ((read = getline(&line, &len, fp)) != -1) {
-      if (links->num >= size) { //check if there is enough space allocated
-         size *= 2;
-         link_conf_t *tmp = (link_conf_t *)
-                             realloc(links->conf, size * sizeof(link_conf_t));
-         if (!tmp) {
-            fprintf(stderr, "Error while reallocating memory for links.\n");
-            goto failure;
-         }
-
-         links->conf = tmp;
-      }
-
-      it = line;
-
-      while (isspace(*it) && *it != '\0' && *it != '\n') {
-         ++it;
-      }
-
-      if (*it == '#') {
-         continue;
-      }
-
-      for (attribute = LINK_NUM, str1 = line; ;attribute++, str1 = NULL) {
-         tok = strtok_r(str1, ",", &save_pt1);
-         if (tok == NULL) {
-             break;
-         }
-
-         switch (attribute) {
-         case LINK_NUM: //parsing link number
-            num = 0;
-            if (sscanf(tok, "%d", &num) == EOF) {
-               fprintf(stderr, "Error: Parsing link value failed.\n");
-               goto failure;
-            }
-            links->conf[links->num].m_val = num;
-            break;
-
-         case LINK_NAME: //parsing link name
-            links->conf[links->num].m_name = strdup(tok);
-            if (!(links->conf[links->num].m_name)) {
-               fprintf(stderr, "Error: Cannot parse LINK_NAME.\n");
-               goto failure;
-            }
-            break;
-
-         case LINK_UR_FIELD: //parsing UR_FIELD
-            links->conf[links->num].m_ur_field = strdup(tok);
-            if (!links->conf[links->num].m_ur_field) {
-               fprintf(stderr, "Error: Cannot parse LINK_UR_FIELD.\n");
-               goto failure;
-            }
-            break;
-
-         case LINK_COL: //parsing line color
-            num = 0;
-            if (sscanf(tok, "%d", &num) == EOF) {
-               fprintf(stderr, "Error: Parsing color failed.\n");
-               goto failure;
-            }
-            links->conf[links->num].m_color = num;
-            break;
-         }
-      }
-      links->conf[links->num].m_id = links->num;
-      links->num++;
-      free(line);
-      line = NULL;
-      len = 0;
-   }
-
-   fclose(fp);
-
-   if (line) {
-      free(line);
-   }
-
-   printf(">Configuration success.\n");
-   return 0;
-
-failure:
-   if (fp) {
-      fclose(fp);
-   }
-
-   if (line) {
-      free(line);
-   }
-
-   return 1;
 }
 
 /**
@@ -318,46 +173,63 @@ size_t header_len = 0;
  */
 int prepare_data(link_load_t *links)
 {
-   size_t i = 0, size;
+   /* every time somebody connects to socket header and data is created again \
+      could be improved in the future for header to change only if config changes. */
+   size_t i = 0, size = 0;
+   databuffer_size = 0;
+   header_len = 0;
 
-   if (databuffer == NULL) {
-      databuffer = calloc(4096, sizeof(char));
-      if (databuffer == NULL) {
-         return 0;
-      }
-      databuffer_size = 4096;
-      header_len = 0;
-
-      for (i = 0; i < links->num; i++) {
-         if (!links->conf[i].m_name) {
-            fprintf(stderr, "Error: No links names loaded.\n");
-            return 0;
-         }
-         header_len += snprintf(databuffer + header_len, databuffer_size - header_len,
-                                "%s-in-bytes,%s-in-flows,%s-in-packets,%s-out-bytes,%s-out-flows,%s-out-packets,",
-                                 links->conf[i].m_name,links->conf[i].m_name,links->conf[i].m_name,
-                                 links->conf[i].m_name,links->conf[i].m_name,links->conf[i].m_name);
-      }
-      databuffer[header_len - 1] = '\n';
+   /* determining size of the buffer needed for output text */
+   pthread_mutex_lock(&lock_links);
+   for (i = 0; i < links->num; i++) {
+      databuffer_size += snprintf(NULL, 0,
+                             "%s-in-bytes,%s-in-flows,%s-in-packets,%s-out-bytes,%s-out-flows,%s-out-packets,\n%"
+                             PRIu64",%" PRIu64",%" PRIu32",%" PRIu64",%" PRIu64",%" PRIu32",",
+                             links->conf[i].m_name,links->conf[i].m_name,links->conf[i].m_name,
+                             links->conf[i].m_name,links->conf[i].m_name,links->conf[i].m_name,
+                             links->stats[i].bytes_in, links->stats[i].flows_in, links->stats[i].packets_in,
+                             links->stats[i].bytes_out, links->stats[i].flows_out, links->stats[i].packets_out);
    }
+   pthread_mutex_unlock(&lock_links);
+
+   /* freeing any previous databuffer */
+   if (databuffer) {
+      free(databuffer);
+   }
+
+   databuffer = NULL;
+   databuffer = calloc(databuffer_size + 2, sizeof(char)); /* the '+ 2' is for last \n and \0 */
+   if (databuffer == NULL) {
+      fprintf(stderr, "prepare_data: Cannot allocate memory for output data string.\n");
+      return 0;
+   }
+
+   pthread_mutex_lock(&lock_links);
+   for (i = 0; i < links->num; i++) {
+      header_len += snprintf(databuffer + header_len, databuffer_size - header_len,
+                             "%s-in-bytes,%s-in-flows,%s-in-packets,%s-out-bytes,%s-out-flows,%s-out-packets,",
+                              links->conf[i].m_name,links->conf[i].m_name,links->conf[i].m_name,
+                              links->conf[i].m_name,links->conf[i].m_name,links->conf[i].m_name);
+   }
+   databuffer[header_len - 1] = '\n';
 
    size = header_len;
    for (i = 0; i < links->num; i++) {
-      if (!stats) {
-         fprintf(stderr, "Error: Cannot read from stats.\n");
-         return 0;
-      }
       size += snprintf(databuffer + size, databuffer_size - size, "%"
                        PRIu64",%" PRIu64",%" PRIu32",%" PRIu64",%" PRIu64",%" PRIu32",",
-                       stats[i].bytes_in, stats[i].flows_in, stats[i].packets_in,
-                       stats[i].bytes_out, stats[i].flows_out, stats[i].packets_out);
+                       links->stats[i].bytes_in, links->stats[i].flows_in, links->stats[i].packets_in,
+                       links->stats[i].bytes_out, links->stats[i].flows_out, links->stats[i].packets_out);
    }
+   pthread_mutex_unlock(&lock_links);
    databuffer[size - 1] = '\n';
    databuffer[size] = '\0';
 
    return size;
 }
 
+/**
+ * Sending prepared data - string to open socket.
+ */
 void send_to_sock(const int client_fd, char *str)
 {
    size_t size = strlen(str), sent = 0;
@@ -378,6 +250,9 @@ void send_to_sock(const int client_fd, char *str)
    close(client_fd);
 }
 
+/**
+ * Waiting for clients to connect to unix socket.
+ */
 void *accept_clients(void *arg)
 {
    int client_fd;
@@ -432,20 +307,25 @@ void *accept_clients(void *arg)
 
 /* clean up */
 cleanup:
+   pthread_mutex_lock(&lock_stop);
    stop = 1;
+   pthread_mutex_unlock(&lock_stop);
    trap_terminate();
-   if (fd >= 0) {
+   if (fd) {
       close(fd);
    }
 
    pthread_exit(0);
 }
 
-/* adds data to global array of link_stats_t structures "statistics[]" */
+/*
+ * Adds data to global array of link_stats_t structures "stats[]".
+ */
 void count_stats (uint64_t link,
                   uint8_t direction,
                   ur_template_t *in_tmplt,
-                  const void *in_rec
+                  const void *in_rec,
+                  link_stats_t *stats
                  )
 {
    if (direction == 0) {
@@ -460,11 +340,204 @@ void count_stats (uint64_t link,
    return;
 }
 
+/*
+ * Getting number of links from sysrepo.
+ */
+static int get_links_number(sr_session_ctx_t *session, const char *inst_xpath,
+                            size_t *num)
+{
+   sr_val_t *values = NULL;
+   int ret = SR_ERR_OK;
+   char select_xpath[XPATH_MAX_LEN];
+   snprintf(select_xpath, XPATH_MAX_LEN, "%s/links/*", inst_xpath);
+
+   ret = sr_get_items(session, select_xpath, &values, num);
+   if (SR_ERR_OK != ret) {
+       printf("Error by sr_get_items: %s (XPATH=%s)\n", sr_strerror(ret), select_xpath);
+       return ret;
+   }
+   printf("Number of links in configuration is: %zu\n", *num);
+
+   sr_free_values(values, *num);
+   return ret;
+}
+
+/*
+ * Loading configuration of one leaf of leaf list to stats[i] from sysrepo.
+ */
+static int get_config(sr_session_ctx_t *session, const char *inst_xpath, link_load_t *links)
+{
+   sr_val_t *value = NULL;
+   sr_val_iter_t *iter = NULL;
+   int ret = 0, i = 0;
+   char select_xpath[XPATH_MAX_LEN];
+
+   /* getting link name */
+   snprintf(select_xpath, XPATH_MAX_LEN, "%s/link/name", inst_xpath);
+   ret = sr_get_items_iter(session, select_xpath, &iter);
+   if (SR_ERR_OK != ret) {
+      return 1;
+   }
+
+   while (sr_get_item_next(session, iter, &value) == SR_ERR_OK){
+      if(value->type == SR_STRING_T){
+         links->conf[i].m_name = strdup(value->data.string_val);
+      }
+      sr_free_val(value);
+      i++;
+   }
+   sr_free_val_iter(iter);
+
+   /* getting link color */
+   i = 0;
+   snprintf(select_xpath, XPATH_MAX_LEN, "%s/link/color", inst_xpath);
+   ret = sr_get_items_iter(session, select_xpath, &iter);
+   if (SR_ERR_OK != ret) {
+      return 1;
+   }
+
+   while (sr_get_item_next(session, iter, &value) == SR_ERR_OK){
+      if(value->type == SR_STRING_T) {
+         uint32_t hex;
+         sscanf(value->data.string_val, "%"SCNx32, &hex);
+         links->conf[i].m_color = hex;
+      }
+      sr_free_val(value);
+      i++;
+   }
+
+   sr_free_val_iter(iter);
+
+   return ret;
+}
+
+/*
+ * Loading whole configuration from sysrepo to stats[].
+ * inst_xpath example = /link-traffic:instance[name='instance1']
+ */
+int load_links(sr_session_ctx_t *session, link_load_t *links)
+{
+   int ret = 0;
+
+   ret = get_links_number(session, sr_inst_xpath, &(links->num));
+   if (SR_ERR_OK != ret) {
+      fprintf(stderr, "load_links: Couldn't retrieve number of links. Sysrepo error: %s"
+            " (XPATH=%s)\n", sr_strerror(ret), sr_inst_xpath);
+      return ret;
+   }
+
+   links->conf = (link_conf_t *) calloc(links->num, sizeof(link_conf_t));
+   if (links->conf == NULL) {
+      fprintf(stderr, "load_links: Failed to initialise configuration memory.\n");
+      return 1;
+   }
+
+   /* allocate memory for stats, based on loaded number of links */
+   links->stats = (link_stats_t *) calloc(links->num, sizeof(link_stats_t));
+   if (!links->stats) {
+      fprintf(stderr, "Error while allocating memory for stats.\n");
+      return 1;
+   }
+
+   get_config(session, sr_inst_xpath, links);
+   return 0;
+}
+
+/*
+ * Checks whether passed XPATH is part of sr_inst_xpath
+ * */
+static inline int is_xpath_for_this_instance(const char * xpath)
+{
+   size_t xpath_len = strlen(xpath);
+   size_t inst_xpath_len = strlen(sr_inst_xpath);
+   if (xpath_len > inst_xpath_len) {
+      return strncmp(sr_inst_xpath, xpath, inst_xpath_len) == 0;
+   }
+
+   return 0;
+}
+
+static int module_change_cb(sr_session_ctx_t *session, const char *change_xpath, sr_notif_event_t event, void *links_ctx)
+{
+   link_load_t *links = (link_load_t *) links_ctx;
+   int ret = 0;
+   int reload_config = 0;
+
+   sr_change_iter_t *iter = NULL;
+   sr_val_t *new_val = NULL;
+   sr_val_t *old_val = NULL;
+   sr_change_oper_t op;
+
+   ret = sr_get_changes_iter(session, "/link-traffic:instance", &iter);
+   if (ret != SR_ERR_OK) {
+      return ret;
+   }
+
+   ret = sr_get_change_next(session, iter, &op, &old_val, &new_val);
+   while (ret == SR_ERR_OK) {
+      if (old_val != NULL) {
+         if (is_xpath_for_this_instance(old_val->xpath) == 1) {
+            reload_config = 1;
+            sr_free_val(old_val);
+            if (new_val != NULL) {
+               sr_free_val(new_val);
+            }
+            break;
+         }
+         sr_free_val(old_val);
+      }
+
+      if (new_val != NULL) {
+         if (is_xpath_for_this_instance(new_val->xpath) == 1) {
+            reload_config = 1;
+            sr_free_val(new_val);
+            break;
+         }
+         sr_free_val(new_val);
+      }
+      ret = sr_get_change_next(session, iter, &op, &old_val, &new_val);
+   }
+   sr_free_change_iter(iter);
+
+   if (reload_config == 0) {
+      // received change is not change for this instance
+      return SR_ERR_OK;
+   }
+
+   pthread_mutex_lock(&lock_links);
+   clear_conf_struct(links);
+   ret = load_links(session, links);
+   printf("New config has been loaded from sysrepo.\n");
+   pthread_mutex_unlock(&lock_links);
+   if (SR_ERR_OK != ret) {
+      fprintf(stderr, "Error while loading config from sysrepo.\n");
+      pthread_mutex_lock(&lock_stop);
+      stop = 1;
+      pthread_mutex_unlock(&lock_stop);
+      return ret;
+   }
+
+   return SR_ERR_OK;
+}
+
 int main(int argc, char **argv)
 {
    signed char opt;
    ur_template_t *in_tmplt = NULL;
    link_load_t *links = NULL;
+
+   sr_conn_ctx_t *connection = NULL;
+   sr_session_ctx_t *session = NULL;
+   sr_subscription_ctx_t *subscription = NULL;
+
+   if (pthread_mutex_init(&lock_stop, NULL) != 0) {
+      fprintf(stderr, "Failed to initialize mutex: lock_stop");
+      return -1;
+   }
+   if (pthread_mutex_init(&lock_links, NULL) != 0) {
+      fprintf(stderr, "Failed to initialize mutex: lock_links");
+      return -1;
+   }
 
    pthread_t accept_thread;
    pthread_attr_t thrAttr;
@@ -474,40 +547,13 @@ int main(int argc, char **argv)
    /* return value for control of opening sockets and saving loop */
    int ret = 0;
 
-   links = (link_load_t *) calloc(1, sizeof(link_load_t));
-   if (!links) {
-      fprintf(stderr, "Error while allocating memory for loaded configuration.\n");
-      goto cleanup;
-   }
-
-   /* load links configuration file */
-   if (load_links(CONFIG_PATH, links)) {
-      fprintf(stderr, "Error loading configuration.\n");
-      goto cleanup;
-   }
-
-   /* allocate memory for stats, based on loaded number of links */
-   stats = (link_stats_t *) calloc(links->num + 1, sizeof(link_stats_t));
-   if (!stats) {
-      fprintf(stderr, "Error while allocating memory for stats.\n");
-      goto cleanup;
-   }
-
-   // sort links unirec_fields
-   qsort(links->conf, links->num, sizeof(link_conf_t), confcmp);
-
    /* **** TRAP initialization **** */
 
-   /**
-    * Macro allocates and initializes module_info structure according to MODULE_BASIC_INFO and MODULE_PARAMS
-    * definitions earlier in this file. It also creates a string with short_opt letters for getopt
-    * function called "module_getopt_string" and long_options field for getopt_long function in variable "long_options"
-    */
    INIT_MODULE_INFO_STRUCT(MODULE_BASIC_INFO, MODULE_PARAMS)
 
    /**
     * Let TRAP library parse program arguments, extract its parameters and initialize module interfaces
-2   */
+    */
    TRAP_DEFAULT_INITIALIZATION(argc, argv, *module_info);
 
    /**
@@ -515,29 +561,83 @@ int main(int argc, char **argv)
     */
    TRAP_REGISTER_DEFAULT_SIGNAL_HANDLER();
 
-   /**
-    * Parse program arguments defined by MODULE_PARAMS macro with getopt() function (getopt_long() if available)
-    * This macro is defined in config.h file generated by configure script
+   /*
+    * Checking validity of arguments (no arguments are the right choice).
     */
    while ((opt = TRAP_GETOPT(argc, argv, module_getopt_string, long_options)) != -1) {
       switch (opt) {
+         case 'x':
+            sr_inst_xpath = optarg;
+            break;
       default:
-         fprintf(stderr, "Error: Invalid arguments.\n");
+         fprintf(stderr, "Error: Invalid arguments: link_traffic does not expect any arguments.\n");
          goto cleanup;
       }
    }
 
-   /* **** Create UniRec templates **** */
+   if (sr_inst_xpath == NULL) {
+      fprintf(stderr, "Error: Missing argument -x SYSREPO_XPATH.\n");
+      goto cleanup;
+   } else {
+      // make sure XPATH doesn't end with /
+      size_t sr_xpath_last = strlen(sr_inst_xpath) - 1;
+      if (sr_inst_xpath[sr_xpath_last] == '/') {
+         sr_inst_xpath[sr_xpath_last] = '\0';
+      }
+   }
+
+   /* **** Create UniRec template **** */
    in_tmplt = ur_create_input_template(0, "BYTES,LINK_BIT_FIELD,PACKETS,DIR_BIT_FIELD", NULL);
    if (!in_tmplt) {
       fprintf(stderr, "Error: Input template could not be created.\n");
       goto cleanup;
    }
 
+   /* connect to sysrepo */
+   ret = sr_connect("link_traffic", SR_CONN_DEFAULT, &connection);
+   if (SR_ERR_OK != ret) {
+      fprintf(stderr, "Error: sr_connect to sysrepo: %s\n", sr_strerror(ret));
+      goto cleanup;
+   }
+
+   /* start session */
+   ret = sr_session_start(connection, SR_DS_STARTUP, SR_SESS_DEFAULT, &session);
+   if (SR_ERR_OK != ret) {
+      fprintf(stderr, "Error: sysrepo sr_session_start: %s\n", sr_strerror(ret));
+      goto cleanup;
+   }
+
+   links = (link_load_t *) calloc(1, sizeof(link_load_t));
+   if (!links) {
+      fprintf(stderr, "Error: allocating memory for loaded configuration.\n");
+      goto cleanup;
+   }
+
+   /* load link configuration from sysrepo */
+   ret = load_links(session, links);
+   if (SR_ERR_OK != ret) {
+      fprintf(stderr, "Error while loading config from sysrepo.\n");
+      goto cleanup;
+   }
+
+   // Switch session to running datastore for following subscribtions
+   ret = sr_session_switch_ds(session, SR_DS_RUNNING);
+   if (ret != SR_ERR_OK) {
+      fprintf(stderr, "Error: sysrepo sr_session_switch_ds: %s\n", sr_strerror(ret));
+      goto cleanup;
+   }
+   /* set up subscription to sysrepo */
+   ret = sr_module_change_subscribe(session, "link-traffic", module_change_cb, links,
+           0, SR_SUBSCR_APPLY_ONLY, &subscription);
+   if (SR_ERR_OK != ret) {
+       fprintf(stderr, "Error: sysrepo sr_module_change_subscribe: %s\n", sr_strerror(ret));
+       goto cleanup;
+   }
+
    ret = pthread_create(&accept_thread,
                         &thrAttr,
                         accept_clients,
-                        (void*) links);
+                        (void *) links);
 
    if (ret) {
       fprintf(stderr, "Error: Thread creation failed.\n");
@@ -548,10 +648,11 @@ int main(int argc, char **argv)
    /*
     * reading data from input and calling count_stats function to save
     * processed data
-    * */
+    */
    while (!stop) {
       const void *in_rec;
       uint16_t in_rec_size;
+      uint64_t link_index;
       uint8_t direction;
 
       /* Receive data from input interface 0. */
@@ -565,45 +666,58 @@ int main(int argc, char **argv)
       /* Checking size of received data */
       if (in_rec_size < ur_rec_fixlen_size(in_tmplt)) {
          if (in_rec_size <= 1) {
-            break; // End of data (used for testing purposes)
+            break; /* End of data (used for testing purposes) */
          } else {
-            fprintf(stderr, "Error: data with wrong size received \
-                           (expected size: >= %hu, received size: %hu)\n",
+            fprintf(stderr, "Error: data with wrong size received (expected size: >= %hu, received size: %hu)\n",
                     ur_rec_fixlen_size(in_tmplt), in_rec_size);
             break;
          }
       }
-      /* get from what collecto data came and in what direction the flow
+      /* get from what collector data came and in what direction the flow
        * was comming */
+      link_index = __builtin_ctzll(ur_get(in_tmplt, in_rec, F_LINK_BIT_FIELD));
       direction = ur_get(in_tmplt, in_rec, F_DIR_BIT_FIELD);
       /* save data according to information got by the code above */
-      link_conf_t key, *found = NULL;
-      key.m_val = ur_get(in_tmplt, in_rec, F_LINK_BIT_FIELD);
-      found = bsearch(&key, links->conf, links->num, sizeof(link_conf_t), confcmp);
-      if (found != NULL) {
-         count_stats(found->m_id, direction, in_tmplt, in_rec);
-      } else {
-         count_stats(links->num, direction, in_tmplt, in_rec);
+      pthread_mutex_lock(&lock_links);
+      if (links->num > 0) {
+         count_stats(link_index, direction, in_tmplt, in_rec, links->stats);
       }
+      pthread_mutex_unlock(&lock_links);
    }
+   pthread_mutex_lock(&lock_stop);
+   stop = 1;
+   pthread_mutex_unlock(&lock_stop);
+   pthread_join(accept_thread, NULL);
 
-   pthread_cancel(accept_thread);
    /* **** Cleanup **** */
 cleanup:
    if (databuffer) {
       free(databuffer);
    }
-
    if (in_tmplt) {
       ur_free_template(in_tmplt);
    }
-   if (stats) {
-      free(stats);
+   /* sysrepo cleanup *//*
+   if (NULL != subscription) {
+      sr_unsubscribe(session, subscription);
+   }*/
+   if (NULL != session) {
+      sr_session_stop(session);
    }
+   if (NULL != connection) {
+      sr_disconnect(connection);
+   }
+
    clear_conf_struct(links);
+   if (links){
+      free(links);
+   }
    pthread_attr_destroy(&thrAttr);
-   TRAP_DEFAULT_FINALIZATION();
+   TRAP_DEFAULT_FINALIZATION()
    FREE_MODULE_INFO_STRUCT(MODULE_BASIC_INFO, MODULE_PARAMS)
    ur_finalize();
+   pthread_mutex_destroy(&lock_stop);
+   pthread_mutex_destroy(&lock_links);
+
    return 0;
 }

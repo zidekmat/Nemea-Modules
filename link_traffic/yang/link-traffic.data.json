@@ -1,0 +1,56 @@
+{
+  "link-traffic:instance": [
+    {
+      "name": "instance 1",
+      "links": {
+        "link": [
+          {
+            "link_id": 0,
+            "name": "aconet",
+            "color": "490099"
+          },
+          {
+            "link_id": 1,
+            "name": "geant",
+            "color": "008000"
+          },
+          {
+            "link_id": 2,
+            "name": "nix4",
+            "color": "99a0a9"
+          },
+          {
+            "link_id": 3,
+            "name": "nix3",
+            "color": "af69bc"
+          },
+          {
+            "link_id": 4,
+            "name": "pioneer",
+            "color": "ff0000"
+          },
+          {
+            "link_id": 5,
+            "name": "sanet",
+            "color": "1e90ff"
+          },
+          {
+            "link_id": 6,
+            "name": "telia",
+            "color": "776655"
+          },
+          {
+            "link_id": 7,
+            "name": "telia2",
+            "color": "bc9269"
+          },
+          {
+            "link_id": 8,
+            "name": "amsix",
+            "color": "af99dc"
+          }
+        ]
+      }
+    }
+  ]
+}
