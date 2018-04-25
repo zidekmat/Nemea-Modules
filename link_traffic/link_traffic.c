@@ -44,7 +44,7 @@
  */
 
 #ifdef HAVE_CONFIG_H
-#include <config.h>
+#include "config.h"
 #endif
 
 #define _GNU_SOURCE
@@ -82,9 +82,10 @@ trap_module_info_t *module_info = NULL;
 #define MODULE_BASIC_INFO(BASIC) \
   BASIC("Link Flows Counter","This module counts statistics according to link and direction.", 1, 0)
 #define MODULE_PARAMS(PARAM) \
-   PARAM('x', "sysrepo_xpath", "Sysrepo XPATH to instance configuration", required_argument, "string")
+   PARAM('x', "nemea-instance-name", "Name of instance for which configuration from sysrepo should be loaded", required_argument, "string")
 #define DEF_SOCKET_PATH "/var/run/libtrap/munin_link_traffic"
-#define XPATH_MAX_LEN 164 // the longest XPATH that node in YANG schema can have
+#define XPATH_MAX_LEN 500 // the longest XPATH that node in YANG schema can have
+#define SR_MODULE_NAME "link-traffic" // Name of sysrepo module for this application
 
 static volatile int stop = 0;
 char *sr_inst_xpath = NULL;
@@ -529,6 +530,7 @@ int main(int argc, char **argv)
    sr_conn_ctx_t *connection = NULL;
    sr_session_ctx_t *session = NULL;
    sr_subscription_ctx_t *subscription = NULL;
+   char * instance_name = NULL;
 
    if (pthread_mutex_init(&lock_stop, NULL) != 0) {
       fprintf(stderr, "Failed to initialize mutex: lock_stop");
@@ -567,23 +569,22 @@ int main(int argc, char **argv)
    while ((opt = TRAP_GETOPT(argc, argv, module_getopt_string, long_options)) != -1) {
       switch (opt) {
          case 'x':
-            sr_inst_xpath = optarg;
+            instance_name = optarg;
             break;
-      default:
-         fprintf(stderr, "Error: Invalid arguments: link_traffic does not expect any arguments.\n");
-         goto cleanup;
+         default:
+            fprintf(stderr, "Error: Missing argument -x NAME_OF_INSTANCE_TO_START.\n");
+            goto cleanup;
       }
    }
 
-   if (sr_inst_xpath == NULL) {
-      fprintf(stderr, "Error: Missing argument -x SYSREPO_XPATH.\n");
+   if (instance_name == NULL) {
+      fprintf(stderr, "Error: Missing argument -x NAME_OF_INSTANCE_TO_START.\n");
       goto cleanup;
    } else {
-      // make sure XPATH doesn't end with /
-      size_t sr_xpath_last = strlen(sr_inst_xpath) - 1;
-      if (sr_inst_xpath[sr_xpath_last] == '/') {
-         sr_inst_xpath[sr_xpath_last] = '\0';
-      }
+      // create XPATH for which this application should subscribe
+      size_t sr_inst_xpath_len = strlen(instance_name) + strlen(SR_MODULE_NAME) + 20;
+      sr_inst_xpath = calloc(sr_inst_xpath_len, sizeof(char));
+      sprintf(sr_inst_xpath, "/"SR_MODULE_NAME":instance[name='%s']", instance_name);
    }
 
    /* **** Create UniRec template **** */
